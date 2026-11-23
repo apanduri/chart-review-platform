@@ -64,10 +64,13 @@ describe("read_criterion field_id validation", () => {
     expect(body.content).toBe(CRITERION_BODY);
   });
 
-  it("reads a hyphenated field_id (batch)", async () => {
+  it("lists a hyphenated field_id via the compact read_criteria (no body)", async () => {
+    // read_criteria is a COMPACT overview — field_id + header only, never
+    // the criterion body. Agents call read_criterion per field for the body.
     const body = parseResult(await readCriteriaTool(hyphenSession, { field_ids: [CRITERION_ID] }));
     expect(body.ok).toBe(true);
-    expect(body.criteria?.[0]?.content ?? body.results?.[0]?.content).toBe(CRITERION_BODY);
+    expect(body.criteria?.[0]?.field_id).toBe(CRITERION_ID);
+    expect(body.criteria?.[0]?.content).toBeUndefined();
   });
 
   it("still rejects path traversal", async () => {
@@ -247,12 +250,20 @@ describe("readCriterionTool pre-fetch", () => {
   });
 });
 
-describe("readCriteriaTool pre-fetch (batch)", () => {
+// ─────────────────────────────────────────────────────────────────────────────
+// readCriteriaTool is the COMPACT rubric overview. It must NOT return the
+// criterion body and must NOT run the keyword-set prefetch — batching both
+// across N criteria blew past deepagents' per-tool-result threshold and the
+// runtime offloaded the result to /large_tool_results/<id>, which the agent
+// then couldn't page past the first 100 lines (the 190-recursion-limit kill
+// seen in the Nov-20 ACTS pilot). Prefetch is exclusively on read_criterion.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("readCriteriaTool compact overview (no body, no prefetch)", () => {
   let tmp: string;
   let prevRubricRoot: string | undefined;
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "acts-prefetch-batch-"));
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "acts-compact-batch-"));
     prevRubricRoot = process.env.CHART_REVIEW_RUBRIC_ROOT;
     process.env.CHART_REVIEW_RUBRIC_ROOT = tmp;
   });
@@ -263,24 +274,75 @@ describe("readCriteriaTool pre-fetch (batch)", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("attaches pre_retrieved_evidence only to the entries whose criterion has uses:", async () => {
+  it("returns prompt + answer_schema + keyword_sets_declared, but NO body and NO hits", async () => {
     writeCriterion(tmp, "smoking_status",
-      "field_id: smoking_status\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_smoking_tobacco",
-      "");
+      "field_id: smoking_status\nprompt: What is the smoking status?\nanswer_schema:\n  enum: [current, former, never, unknown]\nuses:\n  keyword_sets:\n    - kw_smoking_tobacco",
+      "# SHOULD NOT APPEAR IN BATCH RESPONSE\nFull body with extraction rules …");
     writeCriterion(tmp, "no_uses_field",
-      "field_id: no_uses_field\nprompt: x\nanswer_schema:\n  type: string",
-      "");
+      "field_id: no_uses_field\nprompt: A plain field\nanswer_schema:\n  type: string",
+      "# body");
 
     const res = await readCriteriaTool(makePrefetchSession(true), {
       field_ids: ["smoking_status", "no_uses_field"],
     });
     const body = parseResult(res);
+
     expect(body.ok).toBe(true);
     expect(body.count).toBe(2);
+    expect(body.guidance).toContain("read_criterion");
+
     const bySmoking = body.criteria.find((c: any) => c.field_id === "smoking_status");
+    expect(bySmoking.prompt).toBe("What is the smoking status?");
+    expect(bySmoking.answer_schema).toEqual({ enum: ["current", "former", "never", "unknown"] });
+    expect(bySmoking.keyword_sets_declared).toEqual(["kw_smoking_tobacco"]);
+    expect(bySmoking.content).toBeUndefined();
+    expect(bySmoking.pre_retrieved_evidence).toBeUndefined();
+
     const byPlain = body.criteria.find((c: any) => c.field_id === "no_uses_field");
-    expect(bySmoking.pre_retrieved_evidence).toBeDefined();
-    expect(bySmoking.pre_retrieved_evidence.total_hits).toBeGreaterThan(0);
-    expect(byPlain.pre_retrieved_evidence).toBeUndefined();
+    expect(byPlain.prompt).toBe("A plain field");
+    expect(byPlain.answer_schema).toEqual({ type: "string" });
+    expect(byPlain.keyword_sets_declared).toBeUndefined();
+    expect(byPlain.content).toBeUndefined();
+  });
+
+  it("does not call search_notes while building the compact batch (no prefetch on this path)", async () => {
+    // The point of compact read_criteria is that bootstrapping the rubric
+    // costs zero search_notes calls. If prefetch ever gets re-wired on the
+    // batch path, this assertion flips and we catch the regression.
+    writeCriterion(tmp, "smoking_status",
+      "field_id: smoking_status\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_smoking_tobacco",
+      "");
+
+    const { readNote } = await import("@chart-review/patients") as any;
+    const callsBefore = (readNote as ReturnType<typeof vi.fn>).mock.calls.length;
+    await readCriteriaTool(makePrefetchSession(true), { field_ids: ["smoking_status"] });
+    const callsAfter = (readNote as ReturnType<typeof vi.fn>).mock.calls.length;
+    // search_notes internally reads notes via readNote. Zero hits was the
+    // signal that prefetch didn't fire; equivalently, readNote was never
+    // touched during compact read_criteria.
+    expect(callsAfter).toBe(callsBefore);
+  });
+
+  it("keeps the batch response small (serialized size well below the offload threshold)", async () => {
+    // Simulate a 29-criterion ACTS rubric with a long realistic body. The
+    // compact response must stay small even when every criterion's body is
+    // huge, because the body is deliberately omitted.
+    const LONG_BODY = "# Criterion\n\n" + "Lorem ipsum dolor sit amet, ".repeat(400);
+    const ids: string[] = [];
+    for (let i = 0; i < 29; i++) {
+      const fid = `field_${i}`;
+      ids.push(fid);
+      writeCriterion(tmp, fid,
+        `field_id: ${fid}\nprompt: question ${i} about something\nanswer_schema:\n  type: integer\n  minimum: 0\n  maximum: 100\nuses:\n  keyword_sets:\n    - kw_${i}`,
+        LONG_BODY);
+    }
+    const res = await readCriteriaTool(makePrefetchSession(true), { field_ids: ids });
+    const serialized = (res.content[0] as { text: string }).text;
+    const body = JSON.parse(serialized);
+    expect(body.count).toBe(29);
+    // 8 KiB is the per-note read-cap the platform uses to stay under
+    // deepagents' large-tool-result offload; our batch overview is well
+    // below even that.
+    expect(serialized.length).toBeLessThan(8 * 1024);
   });
 });

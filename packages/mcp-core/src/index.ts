@@ -1072,6 +1072,55 @@ export const readCriteriaArgsSchema = z.object({
 });
 export type ReadCriteriaArgs = z.infer<typeof readCriteriaArgsSchema>;
 
+// Extract a compact header (prompt + answer_schema + uses.keyword_sets) from
+// a criterion markdown's YAML frontmatter. Returns {} when frontmatter is
+// missing or malformed — the agent still gets field_id back.
+function parseCriterionHeader(markdown: string): {
+  prompt?: string;
+  answer_schema?: unknown;
+  keyword_sets_declared?: string[];
+} {
+  const m = FRONTMATTER_RE.exec(markdown);
+  if (!m) return {};
+  let fm: unknown;
+  try { fm = parseYaml(m[1]); } catch { return {}; }
+  if (!fm || typeof fm !== "object") return {};
+  const f = fm as Record<string, unknown>;
+  const out: {
+    prompt?: string;
+    answer_schema?: unknown;
+    keyword_sets_declared?: string[];
+  } = {};
+  if (typeof f.prompt === "string") out.prompt = f.prompt;
+  if (f.answer_schema !== undefined) out.answer_schema = f.answer_schema;
+  const uses = f.uses;
+  if (uses && typeof uses === "object") {
+    const ks = (uses as { keyword_sets?: unknown }).keyword_sets;
+    if (Array.isArray(ks)) {
+      const ids = ks.filter((x): x is string => typeof x === "string" && x.length > 0);
+      if (ids.length > 0) out.keyword_sets_declared = ids;
+    }
+  }
+  return out;
+}
+
+// `read_criteria` returns a COMPACT index only: field_id + prompt +
+// answer_schema + which keyword_sets will fire on read_criterion. It does
+// NOT return the criterion body and does NOT run the keyword-set prefetch.
+//
+// Why: the full body + full prefetch for N criteria blew past deepagents'
+// per-tool-result size threshold. deepagents then offloaded the result to
+// `/large_tool_results/<id>`, embedded a pointer in the transcript, and the
+// agent read that file with offset=0 limit=100 in a loop until it hit the
+// graph recursion limit. For the ACTS rubric (29 criteria) this was a hard
+// fail: zero criterion bodies and zero prefetched evidence reached the model.
+// Skipping prefetch in the batch path is also a big perf win — it drops the
+// ~1,160 wasted search_notes calls per rubric bootstrap.
+//
+// Agent flow after this change:
+//   1. list_criteria / read_criteria  → plan which fields to answer
+//   2. read_criterion(field_id)       → full body + pre_retrieved_evidence
+//   3. set_field_assessment           → using hits from step 2
 export async function readCriteriaTool(
   session: McpSession,
   args: ReadCriteriaArgs,
@@ -1090,19 +1139,18 @@ export async function readCriteriaTool(
     }
     try {
       const content = fs.readFileSync(fp, "utf8");
-      const refs = parseCriterionKeywordSetRefs(content);
-      const entry: Record<string, unknown> = { field_id, content };
-      if (refs.length > 0) {
-        entry.pre_retrieved_evidence = await prefetchKeywordHits(session, refs);
-      }
-      results.push(entry);
+      const header = parseCriterionHeader(content);
+      results.push({ field_id, ...header });
     } catch (e) {
       results.push({ field_id, ok: false, error: (e as Error).message });
     }
   }
   return {
     content: [{ type: "text", text: JSON.stringify({
-      ok: true, count: results.length, criteria: results,
+      ok: true,
+      count: results.length,
+      criteria: results,
+      guidance: "Call read_criterion(field_id) to get the full extraction guidance for one criterion and its pre-retrieved evidence hits.",
     }) }],
   };
 }

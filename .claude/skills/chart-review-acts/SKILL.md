@@ -57,23 +57,29 @@ must NOT set them: the APOE allele flags (`apoe2`/`apoe3`/`apoe4`) derive from
     `Active_Amyloid_Tau_Immunization_Reference_Table.md`. `[]` when no vaccine.
 
 1. `list_notes` for the chart's note index. **Platform pre-fetch is on for every
-   ACTS criterion** — when you call `read_criterion` / `read_criteria`, the
-   response carries `pre_retrieved_evidence.hits[]` (snippets the platform
-   already fetched by running `search_notes` for every term in the criterion's
-   `uses.keyword_sets`). Treat those hits as your primary evidence pool. Only
-   call `search_notes` yourself for a follow-up probe the pre-fetch didn't
-   cover (e.g. a rare alias, a date range, a specific note). `read_note` /
-   `read_notes` the candidates each hit points at before citing.
-2. `list_criteria` + `read_criteria([...])` for each field's schema + guidance.
-   Every ACTS criterion returns `pre_retrieved_evidence` — hit list first,
-   then the markdown. **Follow each criterion's rules exactly.**
+   ACTS criterion, and it fires on `read_criterion` ONLY** — when you call
+   `read_criterion(field_id)` the response carries `pre_retrieved_evidence.hits[]`
+   (snippets the platform already fetched by running `search_notes` for every
+   term in the criterion's `uses.keyword_sets`). Treat those hits as your primary
+   evidence pool for that criterion. Only call `search_notes` yourself for a
+   follow-up probe the pre-fetch didn't cover (e.g. a rare alias, a date range,
+   a specific note). `read_note` / `read_notes` the candidates each hit points
+   at before citing.
+2. `list_criteria` + `read_criteria([...])` for a COMPACT rubric overview
+   (prompts + answer schemas + which keyword_sets each field uses — NO body,
+   NO prefetched hits). **Then, for each field you intend to answer, call
+   `read_criterion(field_id)` — THIS is where the full extraction guidance
+   arrives AND where `pre_retrieved_evidence` is attached.** Do NOT try to
+   answer a field from the compact `read_criteria` response; it does not carry
+   the body or the hits. **Follow each criterion's rules exactly.**
 
    **Evidence rule (Path A):** your `rationale_logline` and `evidence[]` must
-   reference ONLY hits that are in `pre_retrieved_evidence.hits` or that you
-   observed in a `search_notes` / `read_note` call you made this run. Never
-   emit a `SEARCHED=[...]; HITS=N` line for a search that did not actually
-   happen; the audit trail records every tool call and silently fabricated
-   log lines will be rejected by the faithfulness gate.
+   reference ONLY hits that are in `pre_retrieved_evidence.hits` (from the
+   field's own `read_criterion` call) or that you observed in a `search_notes`
+   / `read_note` call you made this run. Never emit a `SEARCHED=[...]; HITS=N`
+   line for a search that did not actually happen; the audit trail records every
+   tool call and silently fabricated log lines will be rejected by the
+   faithfulness gate.
 3. For each DOCUMENTED field, commit one answer via
    `set_field_assessment(field_id, answer, confidence, evidence, rationale)`. The
    `answer` must match the field's type: a listed value for enum fields, the

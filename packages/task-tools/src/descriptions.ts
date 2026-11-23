@@ -15,7 +15,7 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   // Criteria (phenotype)
   list_criteria: "List the rubric's criteria (the fields to answer).",
   read_criterion: "Read one criterion's definition + extraction guidance. When the criterion declares `uses.keyword_sets`, the response also carries `pre_retrieved_evidence` — note snippets the platform has already fetched by running search_notes for every term in those sets. Answer from these hits (plus any further search_notes / read_note calls you make); never claim retrieved evidence that is not present in a hit list.",
-  read_criteria: "Read several criteria at once. Each criterion entry may carry `pre_retrieved_evidence` with platform-fetched note snippets, same contract as read_criterion.",
+  read_criteria: "Compact rubric overview (prompt + answer_schema + which keyword_sets will fire on read_criterion). Does NOT return the criterion body and does NOT run the keyword-set prefetch — use read_criterion per field for that.",
   // Write / evidence (phenotype)
   find_quote_offsets: "Locate a verbatim quote's character offsets in a note (for faithful citation).",
   set_field_assessment: "Commit an answer + rationale + evidence for one criterion (faithfulness-gated write).",
