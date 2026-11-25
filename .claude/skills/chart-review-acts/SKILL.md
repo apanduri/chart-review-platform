@@ -73,6 +73,18 @@ must NOT set them: the APOE allele flags (`apoe2`/`apoe3`/`apoe4`) derive from
    answer a field from the compact `read_criteria` response; it does not carry
    the body or the hits. **Follow each criterion's rules exactly.**
 
+   **Call `read_criterion(field_id)` AT MOST ONCE per field per patient.** The
+   rubric body and the prefetched hits do not change within a patient's review.
+   Re-reading the same criterion burns your turn budget and gets you no new
+   information. Keep the response in your working memory for that field; move
+   on to `set_field_assessment` once you've seen the evidence.
+
+   **The platform enforces read-before-write for criteria with
+   `uses.keyword_sets`.** If you call `set_field_assessment` on such a
+   criterion without a prior `read_criterion(field_id)`, the platform returns
+   `{ ok: false, error_code: "read_criterion_required" }`. Call
+   `read_criterion` first, then retry.
+
    **Evidence rule (Path A):** your `rationale_logline` and `evidence[]` must
    reference ONLY hits that are in `pre_retrieved_evidence.hits` (from the
    field's own `read_criterion` call) or that you observed in a `search_notes`

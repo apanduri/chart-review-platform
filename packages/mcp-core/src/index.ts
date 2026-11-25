@@ -51,6 +51,12 @@ export interface McpSession {
   patientId: string;
   task: CompiledTask;
   sessionId: string;
+  /** Per-session set of field_ids the agent has read via `read_criterion`
+   *  (singular only — `read_criteria` is a compact overview that does not
+   *  carry the body or the prefetched evidence, so it does not satisfy this).
+   *  Consulted by the `set_field_assessment` gate for criteria that declare
+   *  `uses.keyword_sets`. Lazily initialized on first read. */
+  readCriterionIds?: Set<string>;
 }
 
 /** Optional hook fired after every successful state mutation. The
@@ -349,6 +355,34 @@ export async function setFieldAssessment(
         },
       ],
     };
+  }
+  // ── read-criterion gate ──────────────────────────────────────────
+  // For criteria that declare `uses.keyword_sets` (opt-in per criterion),
+  // require the agent to have called `read_criterion(field_id)` at least
+  // once in this session before accepting a `set_field_assessment` on that
+  // field. The pre-retrieved evidence hits the agent needs to answer this
+  // criterion ride on the `read_criterion` response — refusing without it
+  // caught Sneha's Nov-24 pilot where the agent made 46 `set_field_assessment`
+  // calls on a patient without ever reading the criterion bodies.
+  // Backward-compatible: criteria without `uses.keyword_sets` are unaffected,
+  // so other phenotypes (rucam, cp-depression, asthma, lung, malo, lcn,
+  // cancer-diagnosis) are not gated. Same non-isError convention as above.
+  if (criterionDeclaresKeywordSets(session, payload.field_id)) {
+    if (!session.readCriterionIds?.has(payload.field_id)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              ok: false,
+              action_type: "set_field_assessment",
+              error_code: "read_criterion_required",
+              message: `Call read_criterion("${payload.field_id}") before set_field_assessment — the response carries pre-retrieved evidence snippets you must consult before answering this criterion. read_criteria (batch) is a compact overview only; it does not satisfy this gate.`,
+            }),
+          },
+        ],
+      };
+    }
   }
   const enumVals = field?.answer_schema?.enum;
   return runAction(
@@ -879,6 +913,26 @@ export async function listCriteriaTool(
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
+/** True when the criterion's markdown frontmatter declares
+ *  `uses.keyword_sets`. Used by the `set_field_assessment` read-first gate
+ *  to decide whether to require a prior `read_criterion` for this field.
+ *  Returns false (unsafe-side-off) on any resolution / parse error — a
+ *  missing or malformed criterion must not block the agent. */
+function criterionDeclaresKeywordSets(session: McpSession, fieldId: string): boolean {
+  if (!/^[a-zA-Z0-9_-]+$/.test(fieldId)) return false;
+  try {
+    const fp = path.join(
+      resolveRubricRoot(session.task.task_id), "references", "criteria",
+      `${fieldId}.md`,
+    );
+    if (!fs.existsSync(fp)) return false;
+    const content = fs.readFileSync(fp, "utf8");
+    return parseCriterionKeywordSetRefs(content).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Extract `uses.keyword_sets` from a criterion markdown's YAML frontmatter.
  *  Returns `[]` if frontmatter is missing, malformed, or has no uses block. */
 function parseCriterionKeywordSetRefs(markdown: string): string[] {
@@ -1008,6 +1062,9 @@ export async function readCriterionTool(
     if (refs.length > 0) {
       payload.pre_retrieved_evidence = await prefetchKeywordHits(session, refs);
     }
+    // Record that the agent has read this criterion. The `set_field_assessment`
+    // gate consults this set for criteria that declare `uses.keyword_sets`.
+    (session.readCriterionIds ??= new Set()).add(args.field_id);
     return {
       content: [{ type: "text", text: JSON.stringify(payload) }],
     };

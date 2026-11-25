@@ -15,6 +15,7 @@ import {
   readCriterionTool,
   readCriteriaTool,
   listCriteriaTool,
+  setFieldAssessment,
   type McpSession,
 } from "./index.js";
 
@@ -344,5 +345,161 @@ describe("readCriteriaTool compact overview (no body, no prefetch)", () => {
     // deepagents' large-tool-result offload; our batch overview is well
     // below even that.
     expect(serialized.length).toBeLessThan(8 * 1024);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// set_field_assessment read-first gate.
+// For criteria that declare `uses.keyword_sets`, set_field_assessment must
+// refuse until the agent has called read_criterion for that field in this
+// session. The Nov-24 ACTS pilot (ffdd9c0) showed a patient where the agent
+// made 46 set_field_assessment calls with 0 read_criterion calls — it answered
+// on criteria it never read, so prefetch never fired and evidence was blind.
+// Criteria WITHOUT uses.keyword_sets are unaffected (opt-in, backward-compat).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("setFieldAssessment read-first gate", () => {
+  let tmp: string;
+  let reviewsTmp: string;
+  let prevRubricRoot: string | undefined;
+  let prevReviewsRoot: string | undefined;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "acts-gate-rubric-"));
+    reviewsTmp = fs.mkdtempSync(path.join(os.tmpdir(), "acts-gate-reviews-"));
+    prevRubricRoot = process.env.CHART_REVIEW_RUBRIC_ROOT;
+    prevReviewsRoot = process.env.CHART_REVIEW_REVIEWS_ROOT;
+    process.env.CHART_REVIEW_RUBRIC_ROOT = tmp;
+    process.env.CHART_REVIEW_REVIEWS_ROOT = reviewsTmp;
+  });
+
+  afterEach(() => {
+    if (prevRubricRoot === undefined) delete process.env.CHART_REVIEW_RUBRIC_ROOT;
+    else process.env.CHART_REVIEW_RUBRIC_ROOT = prevRubricRoot;
+    if (prevReviewsRoot === undefined) delete process.env.CHART_REVIEW_REVIEWS_ROOT;
+    else process.env.CHART_REVIEW_REVIEWS_ROOT = prevReviewsRoot;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(reviewsTmp, { recursive: true, force: true });
+  });
+
+  function makeGateSession(): McpSession {
+    return {
+      patientId: "p1",
+      sessionId: "s1",
+      task: {
+        task_id: "acts",
+        task_kind: "phenotype",
+        source_document_sha: "x",
+        fields: [
+          { field_id: "gated_field", answer_schema: { type: "string" } },
+          { field_id: "ungated_field", answer_schema: { type: "string" } },
+        ],
+        operational: {
+          keyword_sets: {
+            kw_x: { id: "kw_x", description: "", terms: ["anything"] },
+          },
+          code_sets: {}, edge_cases: [], exemplars: {},
+          note_type_filters: { filters: {} },
+        },
+      } as any,
+    };
+  }
+
+  it("REJECTS set_field_assessment on a uses.keyword_sets criterion when read_criterion has NOT been called", async () => {
+    writeCriterion(tmp, "gated_field",
+      "field_id: gated_field\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_x",
+      "# body");
+    const s = makeGateSession();
+    const res = await setFieldAssessment(s, {
+      field_id: "gated_field", answer: "something", confidence: "medium",
+    } as any);
+    // Non-isError normal result; agent reads the message and retries properly.
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse((res.content[0] as { text: string }).text);
+    expect(body.ok).toBe(false);
+    expect(body.error_code).toBe("read_criterion_required");
+    expect(body.message).toMatch(/read_criterion\("gated_field"\)/);
+  });
+
+  it("ACCEPTS set_field_assessment on a ungated criterion (no uses.keyword_sets) without read_criterion", async () => {
+    // Backward-compat: phenotypes that don't declare keyword_sets (rucam,
+    // cp-depression, asthma, lung, malo, lcn, cancer-diagnosis) must not break.
+    writeCriterion(tmp, "ungated_field",
+      "field_id: ungated_field\nprompt: x\nanswer_schema:\n  type: string",
+      "# body");
+    const s = makeGateSession();
+    const res = await setFieldAssessment(s, {
+      field_id: "ungated_field", answer: "something", confidence: "medium",
+    } as any);
+    const body = JSON.parse((res.content[0] as { text: string }).text);
+    // Gate must not fire — either the write succeeds, or the response's
+    // error_code is anything OTHER than read_criterion_required (e.g. a
+    // downstream validation that the test harness doesn't need to satisfy).
+    expect(body.error_code).not.toBe("read_criterion_required");
+  });
+
+  it("ACCEPTS set_field_assessment on a gated criterion AFTER read_criterion is called first", async () => {
+    writeCriterion(tmp, "gated_field",
+      "field_id: gated_field\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_x",
+      "# body");
+    const s = makeGateSession();
+    // 1) read_criterion populates session.readCriterionIds.
+    const rr = await readCriterionTool(s, { field_id: "gated_field" });
+    const rrBody = JSON.parse((rr.content[0] as { text: string }).text);
+    expect(rrBody.ok).toBe(true);
+    expect(s.readCriterionIds?.has("gated_field")).toBe(true);
+    // 2) set_field_assessment on the same session no longer trips the gate.
+    const res = await setFieldAssessment(s, {
+      field_id: "gated_field", answer: "something", confidence: "medium",
+    } as any);
+    const body = JSON.parse((res.content[0] as { text: string }).text);
+    expect(body.error_code).not.toBe("read_criterion_required");
+  });
+
+  it("read_criteria (compact batch) does NOT satisfy the gate — only singular read_criterion does", async () => {
+    // Per the compact-response contract: read_criteria returns IDs + prompts
+    // but no body and no prefetched evidence. Treating it as "read" would
+    // let the agent commit on criteria whose prefetched evidence it never saw.
+    writeCriterion(tmp, "gated_field",
+      "field_id: gated_field\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_x",
+      "# body");
+    const s = makeGateSession();
+    await readCriteriaTool(s, { field_ids: ["gated_field"] });
+    expect(s.readCriterionIds?.has("gated_field") ?? false).toBe(false);
+    const res = await setFieldAssessment(s, {
+      field_id: "gated_field", answer: "something", confidence: "medium",
+    } as any);
+    const body = JSON.parse((res.content[0] as { text: string }).text);
+    expect(body.error_code).toBe("read_criterion_required");
+  });
+
+  it("gate carries across separate calls in the SAME session", async () => {
+    writeCriterion(tmp, "gated_field",
+      "field_id: gated_field\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_x",
+      "# body");
+    const s = makeGateSession();
+    await readCriterionTool(s, { field_id: "gated_field" });
+    // Two consecutive set_field_assessment calls — both must pass the gate.
+    for (let i = 0; i < 2; i++) {
+      const res = await setFieldAssessment(s, {
+        field_id: "gated_field", answer: `v${i}`, confidence: "medium",
+      } as any);
+      const body = JSON.parse((res.content[0] as { text: string }).text);
+      expect(body.error_code).not.toBe("read_criterion_required");
+    }
+  });
+
+  it("gate is per-session: a DIFFERENT session's reads do not satisfy this session", async () => {
+    writeCriterion(tmp, "gated_field",
+      "field_id: gated_field\nprompt: x\nanswer_schema:\n  type: string\nuses:\n  keyword_sets:\n    - kw_x",
+      "# body");
+    const s1 = makeGateSession();
+    const s2 = makeGateSession();
+    await readCriterionTool(s1, { field_id: "gated_field" });
+    // s2 has not read, so its set_field_assessment should still be gated.
+    const res = await setFieldAssessment(s2, {
+      field_id: "gated_field", answer: "v", confidence: "medium",
+    } as any);
+    const body = JSON.parse((res.content[0] as { text: string }).text);
+    expect(body.error_code).toBe("read_criterion_required");
   });
 });
