@@ -243,6 +243,9 @@ export function makeReviewMcpServer(
       "later window. The response includes `truncated` + `next_offset` so",
       "you can fetch the rest if needed. Do not `cat`/`sed` notes via shell —",
       "that echoes the entire file into conversation history at every turn.",
+      "`filename` MUST come VERBATIM from list_notes — do not guess,",
+      "auto-complete, or extrapolate sequential names. A name not in",
+      "list_notes returns {ok:false, error_code:\"unknown_note\"}.",
     ].join(" "),
     {
       filename: z.string(),
@@ -331,6 +334,9 @@ export function makeReviewMcpServer(
       "returned_chars, and a truncated flag (per-note max_chars_per_note,",
       "default 8192). Use this when you want to skim every note at once;",
       "use read_note for targeted single-file follow-up.",
+      "Each filename MUST come VERBATIM from list_notes — do not fabricate",
+      "names. A name not in list_notes returns the entry as",
+      "{ok:false, error_code:\"unknown_note\"} rather than reading.",
     ].join(" "),
     {
       filenames: z.array(z.string()).max(50),

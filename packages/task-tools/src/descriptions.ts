@@ -8,8 +8,8 @@ import { toolProfileFor, STRUCTURED_DATA_TOOLS, type ToolProfile } from "./index
 export const TOOL_DESCRIPTIONS: Record<string, string> = {
   // Notes (read) — shared by every agent task
   list_notes: "List the patient's note files (name, date, type).",
-  read_note: "Read one note's full text.",
-  read_notes: "Read several notes' full text at once.",
+  read_note: "Read one note's full text. Filename MUST come verbatim from list_notes; fabricated names return {ok: false, error_code: \"unknown_note\"}.",
+  read_notes: "Read several notes' full text at once. Each filename MUST come verbatim from list_notes; fabricated names return a per-entry {ok: false, error_code: \"unknown_note\"} refusal.",
   search_notes: "Keyword-search across all of the patient's notes.",
   get_note_section: "Pull just a note's relevant sections (Assessment/Labs/HPI…) — cheaper than full text.",
   // Criteria (phenotype)

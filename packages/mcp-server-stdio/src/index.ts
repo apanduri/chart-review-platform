@@ -310,6 +310,10 @@ if (want("read_note")) {
         "lets you fetch a later window. Response includes `truncated` +",
         "`next_offset`. Do not `cat`/`sed` notes via shell — that echoes",
         "the entire file into the conversation history at every turn.",
+        "`filename` MUST come VERBATIM from the list_notes response — do",
+        "not guess, auto-complete, or extrapolate names from patterns in",
+        "other filenames (dates, service types, sequential numbering). A",
+        "name not in list_notes returns {ok:false, error_code:\"unknown_note\"}.",
       ].join(" "),
       inputSchema: {
         filename: z.string(),
@@ -621,6 +625,9 @@ if (want("read_notes")) {
         "large-tool-result offload, which the agent then can't page back).",
         "The entry includes total_chars, returned_chars, and a truncated flag",
         "(max_chars_per_note, default 8192).",
+        "`filename` MUST come VERBATIM from list_notes — do not fabricate or",
+        "extrapolate sequential names. A name not in list_notes returns the",
+        "entry {ok:false, error_code:\"unknown_note\"} rather than reading.",
       ].join(" "),
       inputSchema: {
         // Capped at 1: a single oversized read_notes result is what overflows

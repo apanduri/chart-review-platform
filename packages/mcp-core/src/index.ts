@@ -57,6 +57,13 @@ export interface McpSession {
    *  Consulted by the `set_field_assessment` gate for criteria that declare
    *  `uses.keyword_sets`. Lazily initialized on first read. */
   readCriterionIds?: Set<string>;
+  /** Per-session cache of the real note filenames for this patient, from
+   *  `listNotes`. Lazily populated the first time `read_note` / `read_notes`
+   *  validates a filename. Used to catch the Nov-27 Qwen hallucination mode
+   *  where the agent extrapolated sequential filenames (e.g.
+   *  `043_2015-12-31_Emergency_Dept_MD_Progress_Note.txt`) that did not exist,
+   *  burned the recursion budget retrying, and never started the rubric work. */
+  knownNoteFilenames?: Set<string>;
 }
 
 /** Optional hook fired after every successful state mutation. The
@@ -655,6 +662,15 @@ export async function readNoteTool(
   args: ReadNoteArgs,
 ): Promise<CallToolResult> {
   const filename = args.filename.endsWith(".txt") ? args.filename : `${args.filename}.txt`;
+  // Validate against list_notes before touching the filesystem. Catches
+  // agent-fabricated filenames (the Nov-27 Qwen hallucination mode) with a
+  // clear, prescriptive error rather than a bare ENOENT.
+  const known = knownNoteFilenames(session);
+  if (known.size > 0 && !known.has(filename)) {
+    return {
+      content: [{ type: "text", text: JSON.stringify(unknownNoteRefusal(filename)) }],
+    };
+  }
   let content: string;
   try {
     content = readNoteFn(session.patientId, filename);
@@ -716,6 +732,13 @@ export async function getNoteSectionTool(
   args: GetNoteSectionArgs,
 ): Promise<CallToolResult> {
   const filename = args.filename.endsWith(".txt") ? args.filename : `${args.filename}.txt`;
+  // Same unknown_note validation as read_note / read_notes.
+  const known = knownNoteFilenames(session);
+  if (known.size > 0 && !known.has(filename)) {
+    return {
+      content: [{ type: "text", text: JSON.stringify(unknownNoteRefusal(filename)) }],
+    };
+  }
   let content: string;
   try {
     content = readNoteFn(session.patientId, filename);
@@ -913,6 +936,45 @@ export async function listCriteriaTool(
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
+/** Lazy-populate `session.knownNoteFilenames` from `listNotes` and return it.
+ *  Called once per session on the first `read_note` / `read_notes`; subsequent
+ *  validations hit the cached set. Returns an empty set on resolution error
+ *  so the gate is fail-open (validation must never block an agent when the
+ *  underlying list call is itself failing). */
+function knownNoteFilenames(session: McpSession): Set<string> {
+  if (session.knownNoteFilenames) return session.knownNoteFilenames;
+  const set = new Set<string>();
+  try {
+    for (const n of listNotesFn(session.patientId)) {
+      if (n && typeof (n as { filename?: unknown }).filename === "string") {
+        set.add((n as { filename: string }).filename);
+      }
+    }
+  } catch {
+    // leave empty — validation fail-open
+  }
+  session.knownNoteFilenames = set;
+  return set;
+}
+
+/** Build the structured refusal that `read_note` / `read_notes` return when
+ *  the agent asks for a filename not in the patient's note index. The
+ *  message is deliberately prescriptive: the Nov-27 ACTS pilot showed that a
+ *  bare "ENOENT" from the filesystem was not enough to break Qwen out of a
+ *  sequential-pattern hallucination — the agent needs to be told explicitly
+ *  that it cannot fabricate names from the ones it already saw. */
+function unknownNoteRefusal(filename: string) {
+  return {
+    ok: false,
+    error_code: "unknown_note",
+    message:
+      `No note named "${filename}" exists for this patient. Use filenames VERBATIM from the ` +
+      `list_notes response — do NOT guess, auto-complete, or extrapolate names from patterns ` +
+      `you see in other notes' filenames (dates, service types, sequential numbering). If you ` +
+      `need to see the available filenames again, call list_notes.`,
+  };
+}
+
 /** True when the criterion's markdown frontmatter declares
  *  `uses.keyword_sets`. Used by the `set_field_assessment` read-first gate
  *  to decide whether to require a prior `read_criterion` for this field.
@@ -1096,8 +1158,17 @@ export async function readNotesTool(
 ): Promise<CallToolResult> {
   const per = args.max_chars_per_note ?? READ_NOTE_DEFAULT_MAX;
   const results: Array<Record<string, unknown>> = [];
+  // Validate per-entry against list_notes before touching the filesystem.
+  // Same unknown_note refusal as readNoteTool; per-entry so a mix of real
+  // and fabricated names returns real notes for the real ones and a clear
+  // refusal for the fabricated ones.
+  const known = knownNoteFilenames(session);
   for (const raw of args.filenames) {
     const filename = raw.endsWith(".txt") ? raw : `${raw}.txt`;
+    if (known.size > 0 && !known.has(filename)) {
+      results.push({ filename, ...unknownNoteRefusal(filename) });
+      continue;
+    }
     try {
       const content = readNoteFn(session.patientId, filename);
       const total = content.length;
